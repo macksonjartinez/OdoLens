@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "vitest run",
+    "embed-template": "node scripts/embed-template.mjs templates/informe-estadistico-2026.xlsx src/assets/templateV2026.ts"
   },
   "dependencies": {
     "file-saver": "^2.0.5",
@@ -24,6 +26,7 @@
     "@vitejs/plugin-react": "^4.3.4",
     "tailwindcss": "^4.0.0",
     "typescript": "~5.7.2",
-    "vite": "^6.2.0"
+    "vite": "^6.2.0",
+    "vitest": "^3.2.7"
   }
 }

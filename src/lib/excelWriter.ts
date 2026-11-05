@@ -8,15 +8,26 @@
  */
 
 import JSZip from 'jszip'
+import * as XLSX from 'xlsx'
 import { saveAs } from 'file-saver'
 import type {
   ConsolidatedOutput,
   InformeEconomicoSheet,
   LabeledSheet,
+  LabeledSheetKey,
   MonitoreoSheet,
 } from '../types'
 import { normalizeName, todayISO } from './normalize'
-import { TEMPLATE_BASE64 } from '../assets/template'
+import { TEMPLATE_V2026_BASE64 } from '../assets/templateV2026'
+import { resolveRowId } from '../schema/catalog'
+import {
+  ECONOMICO_SHEET,
+  INPUT_COLS,
+  ODOLENS_OUTPUT_MARKER,
+  findBlock,
+  findEconomicoSignatureRow,
+} from '../schema/reportSchemas'
+import type { DataBlock } from '../schema/reportSchemas'
 
 // ── Column / cell reference helpers ─────────────────────────────────────────
 
@@ -385,7 +396,28 @@ function iterateRange(startRef: string, endRef: string, visit: (ref: string) => 
   }
 }
 
-function evaluateSimpleFormula(formula: string, cellsByRef: Map<string, ParsedCell>): number | null {
+/** Cells of other worksheets, keyed by normalized sheet name, for cross-sheet references */
+type SheetCellIndex = Map<string, Map<string, ParsedCell>>
+
+const CROSS_SHEET_REF_RE = /^(?:'((?:[^']|'')+)'|([^'!]+))!\$?([A-Z]+)\$?(\d+)$/
+
+function evaluateCrossSheetRef(formula: string, otherSheets?: SheetCellIndex): number | null {
+  const match = formula.trim().match(CROSS_SHEET_REF_RE)
+  if (!match || !otherSheets) return null
+  const sheetName = (match[1] ?? match[2]).replace(/''/g, "'")
+  const cells = otherSheets.get(normalizeName(sheetName))
+  if (!cells) return null
+  return getCellNumericValue(cells.get(`${match[3]}${match[4]}`))
+}
+
+function evaluateSimpleFormula(
+  formula: string,
+  cellsByRef: Map<string, ParsedCell>,
+  otherSheets?: SheetCellIndex,
+): number | null {
+  const crossSheet = evaluateCrossSheetRef(formula.replace(/&apos;/g, "'"), otherSheets)
+  if (crossSheet !== null) return crossSheet
+
   const normalized = formula.trim().replace(/\s+/g, '')
 
   const sumMatch = normalized.match(/^SUM\((.+)\)$/i)
@@ -424,7 +456,11 @@ function evaluateSimpleFormula(formula: string, cellsByRef: Map<string, ParsedCe
   return null
 }
 
-function recalculateSimpleFormulas(wsXml: string, sharedStrings: string[]): string {
+function recalculateSimpleFormulas(
+  wsXml: string,
+  sharedStrings: string[],
+  otherSheets?: SheetCellIndex,
+): string {
   let updatedXml = wsXml
 
   // A few passes are enough for the template's dependency chains
@@ -441,7 +477,7 @@ function recalculateSimpleFormulas(wsXml: string, sharedStrings: string[]): stri
       const formula = resolveFormulaText(cell, sharedFormulas)
       if (!formula) continue
 
-      const value = evaluateSimpleFormula(formula, cellsByRef)
+      const value = evaluateSimpleFormula(formula, cellsByRef, otherSheets)
       if (value === null) continue
 
       passXml = setCellValue(passXml, cell.ref, value)
@@ -475,125 +511,76 @@ function processInformeEconomicoSheet(
   wsXml: string,
   sharedStrings: string[],
   consolidated: InformeEconomicoSheet,
+  signatureRow: number | null,
 ): string {
-  for (const [ref, value] of consolidated.sumCells) {
+  for (const [ref, value] of Object.entries(consolidated.sums)) {
     wsXml = setCellValue(wsXml, ref, value)
   }
 
-  for (const [ref, value] of consolidated.copiedCells) {
-    if (value === null || value === '') continue
-    wsXml = setCellValue(wsXml, ref, typeof value === 'number' ? value : String(value))
+  if (consolidated.concept) wsXml = setCellValue(wsXml, 'I13', consolidated.concept)
+  if (consolidated.supplier) wsXml = setCellValue(wsXml, 'J13', consolidated.supplier)
+
+  if (signatureRow) {
+    if (consolidated.signer) wsXml = setCellValue(wsXml, `D${signatureRow}`, consolidated.signer)
+    if (consolidated.sentDate !== null) wsXml = setCellValue(wsXml, `J${signatureRow}`, consolidated.sentDate)
   }
 
   return recalculateSimpleFormulas(wsXml, sharedStrings)
-}
-
-const MONITOREO_HEADER_LABEL = normalizeName('Nombre del Dr')
-
-function getSortedRowCells(byRow: Map<number, ParsedCell[]>, rowIdx: number): ParsedCell[] {
-  return (byRow.get(rowIdx) ?? []).slice().sort((a, b) => a.col - b.col)
-}
-
-function getFirstCellInRow(byRow: Map<number, ParsedCell[]>, rowIdx: number): ParsedCell | undefined {
-  return getSortedRowCells(byRow, rowIdx)[0]
-}
-
-function findMonitoreoHeaderRowIdx(
-  byRow: Map<number, ParsedCell[]>,
-  sortedRows: number[],
-): number {
-  return sortedRows.find((rowIdx) => {
-    const firstCell = getFirstCellInRow(byRow, rowIdx)
-    return normalizeName(firstCell?.textValue ?? '') === MONITOREO_HEADER_LABEL
-  }) ?? -1
-}
-
-function findMonitoreoTotalCol(
-  byRow: Map<number, ParsedCell[]>,
-  sortedRows: number[],
-  headerRowIdx: number,
-  labelCol: number,
-): number {
-  for (const rowIdx of sortedRows) {
-    if (rowIdx <= headerRowIdx) continue
-
-    const rowCells = getSortedRowCells(byRow, rowIdx)
-    const labelCell = rowCells.find((cell) => cell.col === labelCol)
-    if (!labelCell?.textValue.trim()) continue
-
-    const formulaCell = rowCells.find((cell) => cell.hasFormula)
-    if (formulaCell) return formulaCell.col
-  }
-
-  const headerCells = getSortedRowCells(byRow, headerRowIdx)
-  return Math.max(...headerCells.map((cell) => cell.col)) + 1
-}
-
-function rebuildRowsMap(cells: ParsedCell[]): Map<number, ParsedCell[]> {
-  const byRow = new Map<number, ParsedCell[]>()
-  for (const cell of cells) {
-    if (!byRow.has(cell.row)) byRow.set(cell.row, [])
-    byRow.get(cell.row)!.push(cell)
-  }
-  return byRow
 }
 
 // ── Sheets 1–4: update numeric cell values by row-label match ────────────────
 
+/**
+ * Write the canonical values of one label-driven sheet into the template.
+ * Only rows inside the anchored data block are touched, each value goes to the
+ * same column letter it was read from, and formula cells are never overwritten.
+ * Capture cells without data are written as blank so no template value survives.
+ */
 function processLabeledSheet(
   wsXml: string,
   sharedStrings: string[],
   consolidated: LabeledSheet,
+  key: LabeledSheetKey,
+  block: DataBlock | null,
+  otherSheets?: SheetCellIndex,
 ): string {
-  const cells = parseWorksheetCells(wsXml, sharedStrings)
+  if (!block) return wsXml
+  const cellsByRef = new Map(parseWorksheetCells(wsXml, sharedStrings).map((cell) => [cell.ref, cell]))
 
-  // Build normalized-label → values lookup
-  const normData = new Map<string, number[]>()
-  for (const [label, values] of consolidated.data) {
-    normData.set(normalizeName(label), values)
-  }
+  for (let row = block.firstRow; row <= block.lastRow; row++) {
+    const label = cellsByRef.get(`A${row}`)?.textValue.trim()
+    if (!label) continue
 
-  // Group cells by row, sort columns within each row
-  const byRow = new Map<number, ParsedCell[]>()
-  for (const cell of cells) {
-    if (!byRow.has(cell.row)) byRow.set(cell.row, [])
-    byRow.get(cell.row)!.push(cell)
-  }
+    const resolved = resolveRowId(key, label)
+    const values = 'id' in resolved ? consolidated.values.get(resolved.id) : undefined
 
-  const sortedRows = [...byRow.keys()].sort((a, b) => a - b)
-  const headerRow = sortedRows[0] // skip the first row (headers)
-
-  for (const rowIdx of sortedRows) {
-    if (rowIdx === headerRow) continue
-
-    const rowCells = byRow.get(rowIdx)!.sort((a, b) => a.col - b.col)
-    const labelCell = rowCells[0]
-    if (!labelCell?.textValue.trim()) continue
-
-    const values = normData.get(normalizeName(labelCell.textValue.trim()))
-    if (!values) continue
-
-    // Preserve the original write behavior: fill the non-formula numeric inputs
-    // in order, then recalculate the visible total formulas afterwards.
-    const dataCells = rowCells.filter(
-      (c) => c.col > labelCell.col && !c.hasFormula && (c.type === '' || c.type === 'n'),
-    )
-
-    for (let i = 0; i < dataCells.length; i++) {
-      if (i < values.length) {
-        wsXml = setCellValue(wsXml, dataCells[i].ref, values[i])
-      }
+    for (const col of INPUT_COLS) {
+      const target = cellsByRef.get(`${col}${row}`)
+      if (!target || target.hasFormula) continue
+      wsXml = setCellValue(wsXml, target.ref, values?.[col] ?? 0)
     }
   }
 
-  return recalculateSimpleFormulas(wsXml, sharedStrings)
+  return recalculateSimpleFormulas(wsXml, sharedStrings, otherSheets)
 }
 
-// ── Sheet 5 (Monitoreo): update existing doctors + insert new ones ───────────
+// ── Sheet 5 (Monitoreo): doctor columns, formula roles and column expansion ──
+
+/** Shift same-sheet A1 references whose column is ≥ fromCol (like Excel's column insert). */
+function shiftFormulaColumns(formula: string, fromCol: number, count: number): string {
+  return formula.replace(
+    /(^|[^A-Za-z0-9_!'])(\$?)([A-Z]{1,3})(\$?)(\d+)(?![A-Za-z0-9_(])/g,
+    (match, pre: string, colAbs: string, letters: string, rowAbs: string, rowNum: string) => {
+      const col = colIndex(letters)
+      if (col < fromCol) return match
+      return `${pre}${colAbs}${colLetters(col + count)}${rowAbs}${rowNum}`
+    },
+  )
+}
 
 /**
- * Shift every cell reference at column ≥ fromCol rightward by `count` columns.
- * Updates r="..." attributes and the row's spans="start:end" attribute.
+ * Shift every cell reference at column ≥ fromCol rightward by `count` columns:
+ * r="..." attributes, the row spans="start:end" attribute and formula texts.
  */
 function shiftCellsRight(xml: string, fromCol: number, count: number): string {
   // Shift individual cell r attributes
@@ -615,7 +602,10 @@ function shiftCellsRight(xml: string, fromCol: number, count: number): string {
     return `${pre}${newStart}:${newEnd}${post}`
   })
 
-  return xml
+  // Formulas keep pointing at the same (moved) cells
+  return xml.replace(/<f\b([^>]*)>([^<]*)<\/f>/g, (_, attrs: string, text: string) => {
+    return `<f${attrs}>${shiftFormulaColumns(text, fromCol, count)}</f>`
+  })
 }
 
 function setColRange(colTag: string, min: number, max: number): string {
@@ -693,23 +683,47 @@ function shiftWorksheetMergeRefsRight(xml: string, fromCol: number, count: numbe
 }
 
 /**
- * Insert a new <c> element at the given position (col/row) into a row block.
- * `styleAttr` is the verbatim s="N" attribute to apply (copy from neighbour).
+ * Shift one range ("B23:AF117" or "AC119"). Ranges that end on the last doctor
+ * column grow with the inserted column so new doctors share its validation.
  */
-function insertCellInRow(
-  rowXml: string,
-  newRef: string,
-  value: number | string,
-  styleAttr: string,
-): string {
-  const isNum = typeof value === 'number'
-  const sAttr = styleAttr ? ` ${styleAttr}` : ''
-  const newCell = isNum
-    ? value === 0
-      ? `<c r="${newRef}"${sAttr}/>`
-      : `<c r="${newRef}"${sAttr}><v>${value}</v></c>`
-    : `<c r="${newRef}"${sAttr} t="inlineStr"><is><t xml:space="preserve">${escapeXml(String(value))}</t></is></c>`
+function shiftRangeRef(range: string, fromCol: number, count: number, lastDoctorCol: number): string {
+  const [startRef, endRef = startRef] = range.split(':')
+  const start = parseCellRef(startRef)
+  const end = parseCellRef(endRef)
+  if (!start || !end) return range
 
+  const startCol = start.col >= fromCol ? start.col + count : start.col
+  const endCol = end.col >= fromCol || end.col === lastDoctorCol ? end.col + count : end.col
+  const nextStart = encodeCellRef(startCol, start.row)
+  const nextEnd = encodeCellRef(endCol, end.row)
+  return range.includes(':') || nextStart !== nextEnd ? `${nextStart}:${nextEnd}` : nextStart
+}
+
+/** Data validations, conditional formats (incl. x14 extensions) and <dimension>. */
+function shiftSqrefsRight(xml: string, fromCol: number, count: number, lastDoctorCol: number): string {
+  const shiftList = (list: string) => list
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((range) => shiftRangeRef(range, fromCol, count, lastDoctorCol))
+    .join(' ')
+
+  return xml
+    .replace(
+      /(<(?:dataValidation|conditionalFormatting)\b[^>]*\bsqref=")([^"]+)(")/g,
+      (_, open: string, list: string, close: string) => `${open}${shiftList(list)}${close}`,
+    )
+    .replace(
+      /(<xm:sqref>)([^<]+)(<\/xm:sqref>)/g,
+      (_, open: string, list: string, close: string) => `${open}${shiftList(list)}${close}`,
+    )
+    .replace(
+      /(<dimension ref=")([^"]+)(")/,
+      (_, open: string, ref: string, close: string) => `${open}${shiftRangeRef(ref, fromCol, count, -1)}${close}`,
+    )
+}
+
+/** Insert a prebuilt <c> element into a row block, keeping column order. */
+function insertCellXml(rowXml: string, newRef: string, cellXml: string): string {
   const pos = parseCellRef(newRef)
   if (!pos) return rowXml
 
@@ -723,155 +737,155 @@ function insertCellInRow(
     const p = parseCellRef(refM[1])
     if (p && p.col >= pos.col) {
       inserted = true
-      return `${newCell}${tag}`
+      return `${cellXml}${tag}`
     }
     return tag
   })
 
   // If nothing was replaced (new column is the last one), append before </row>
   if (!inserted) {
-    return rowXml.replace('</row>', `${newCell}</row>`)
+    return rowXml.replace('</row>', `${cellXml}</row>`)
   }
   return insertBefore
 }
 
+/** Add a cell to an existing (non-empty) row of the sheet. */
+function insertCellIntoSheet(xml: string, ref: string, cellXml: string): string {
+  const pos = parseCellRef(ref)
+  if (!pos) return xml
+  const rowRe = new RegExp(`<row\\b[^>]*?\\br="${pos.row + 1}"[^>]*>[\\s\\S]*?</row>`)
+  return xml.replace(rowRe, (rowXml) => insertCellXml(rowXml, ref, cellXml))
+}
+
+/**
+ * Insert one doctor column at `insertAt` (the current total column). Every row
+ * of the doctor table gets a cell styled like the previous doctor column; rows
+ * where that column holds a per-doctor formula get the same formula shifted.
+ */
+function insertDoctorColumn(
+  xml: string,
+  sharedStrings: string[],
+  insertAt: number,
+  block: DataBlock & { headerRow: number },
+): string {
+  const lastDoctorCol = insertAt - 1
+
+  xml = shiftCellsRight(xml, insertAt, 1)
+  xml = shiftWorksheetColumnsRight(xml, insertAt, 1)
+  xml = shiftWorksheetMergeRefsRight(xml, insertAt, 1)
+  xml = shiftSqrefsRight(xml, insertAt, 1, lastDoctorCol)
+
+  const cellsByRef = new Map(parseWorksheetCells(xml, sharedStrings).map((cell) => [cell.ref, cell]))
+
+  return xml.replace(/<row\b[^>]*?(?:\/>|>[\s\S]*?<\/row>)/g, (rowXml) => {
+    const rowNum = Number(rowXml.match(/^<row\b[^>]*?\br="(\d+)"/)?.[1])
+    if (!rowNum || rowNum < block.headerRow || rowNum > block.lastRow) return rowXml
+
+    const previous = cellsByRef.get(encodeCellRef(lastDoctorCol, rowNum - 1))
+    if (!previous) return rowXml
+
+    const newRef = encodeCellRef(insertAt, rowNum - 1)
+    const sAttr = previous.styleAttr ? ` ${previous.styleAttr}` : ''
+    const formula = previous.hasFormula ? previous.formulaText.trim() : ''
+    const cellXml = formula
+      ? `<c r="${newRef}"${sAttr}><f>${shiftFormulaRefs(formula, 0, 1)}</f></c>`
+      : `<c r="${newRef}"${sAttr}/>`
+    return insertCellXml(rowXml, newRef, cellXml)
+  })
+}
+
+const HORIZONTAL_SUM_RE = /^SUM\(\$?([A-Z]+)\$?(\d+):\$?([A-Z]+)\$?(\d+)\)$/
+
+/**
+ * Write doctors into the Monitoreo template.
+ *
+ * Formula roles are kept: per-doctor formulas (TOTAL ASEGURADOS, TOTAL DE
+ * PROCEDIMIENTOS...) are never overwritten, vertical subtotals of the total
+ * column (AF28=SUM(AF29:AF31)) are preserved, and only same-row totals
+ * (SUM(B12:AE12)) are regenerated over the final doctor range.
+ */
 function processMonitoreoSheet(
   wsXml: string,
   sharedStrings: string[],
   consolidated: MonitoreoSheet,
+  block: DataBlock | null,
 ): string {
-  let cells = parseWorksheetCells(wsXml, sharedStrings)
-  let byRow = rebuildRowsMap(cells)
-  let sortedRows = [...byRow.keys()].sort((a, b) => a - b)
+  if (!block?.headerRow) return wsXml
+  const table = { ...block, headerRow: block.headerRow }
+  const headerRowIdx = table.headerRow - 1
 
-  const headerRowIdx = findMonitoreoHeaderRowIdx(byRow, sortedRows)
-  if (headerRowIdx < 0) return wsXml
+  // Explicit formulas first: shared-formula groups cannot survive column moves
+  wsXml = normalizeSheetFormulas(wsXml, sharedStrings)
 
-  const headerCells = getSortedRowCells(byRow, headerRowIdx)
-  const labelCol = headerCells[0]?.col ?? 0
-  let totalCol = findMonitoreoTotalCol(byRow, sortedRows, headerRowIdx, labelCol)
+  let cellsByRef = new Map(parseWorksheetCells(wsXml, sharedStrings).map((cell) => [cell.ref, cell]))
+  const maxCol = Math.max(...[...cellsByRef.values()].map((cell) => cell.col))
 
-  let doctorCols = headerCells
-    .filter((cell) => cell.col > labelCol && cell.col < totalCol)
-    .map((cell) => ({ col: cell.col, styleAttr: cell.styleAttr }))
+  let totalCol = 1
+  while (totalCol <= maxCol && !cellsByRef.get(encodeCellRef(totalCol, table.firstRow - 1))?.hasFormula) totalCol++
+
+  const doctorCols: number[] = []
+  for (let col = 1; col < totalCol; col++) {
+    if (cellsByRef.has(encodeCellRef(col, headerRowIdx))) doctorCols.push(col)
+  }
 
   const orderedDoctors = [...consolidated.doctors.values()]
 
   while (orderedDoctors.length > doctorCols.length) {
-    const insertAt = totalCol
-    const headerStyleAttr = doctorCols.length > 0
-      ? doctorCols[doctorCols.length - 1].styleAttr
-      : ''
-
-    wsXml = shiftCellsRight(wsXml, insertAt, 1)
-    wsXml = shiftWorksheetColumnsRight(wsXml, insertAt, 1)
-    wsXml = shiftWorksheetMergeRefsRight(wsXml, insertAt, 1)
+    wsXml = insertDoctorColumn(wsXml, sharedStrings, totalCol, table)
+    doctorCols.push(totalCol)
     totalCol++
-
-    cells = parseWorksheetCells(wsXml, sharedStrings)
-    byRow = rebuildRowsMap(cells)
-    sortedRows = [...byRow.keys()].sort((a, b) => a - b)
-
-    for (const rowIdx of sortedRows) {
-      const rowXmlPattern = new RegExp(`<row\\s[^>]*\\br="${rowIdx + 1}"[^>]*>[\\s\\S]*?</row>`)
-      const newRef = encodeCellRef(insertAt, rowIdx)
-
-      wsXml = wsXml.replace(rowXmlPattern, (rowBlock) => {
-        if (rowIdx < headerRowIdx) {
-          return rowBlock
-        }
-
-        if (rowIdx === headerRowIdx) {
-          return insertCellInRow(rowBlock, newRef, '', headerStyleAttr)
-        }
-
-        const rowCells = getSortedRowCells(byRow, rowIdx)
-        const firstCell = rowCells[0]
-        if (!firstCell?.textValue.trim()) return rowBlock
-
-        const sampleDataCell = rowCells.find(
-          (cell) => cell.col > labelCol && cell.col < totalCol && !cell.hasFormula,
-        )
-        return insertCellInRow(
-          rowBlock,
-          newRef,
-          0,
-          sampleDataCell?.styleAttr ?? headerStyleAttr,
-        )
-      })
-    }
-
-    doctorCols.push({ col: insertAt, styleAttr: headerStyleAttr })
-
-    cells = parseWorksheetCells(wsXml, sharedStrings)
-    byRow = rebuildRowsMap(cells)
-    sortedRows = [...byRow.keys()].sort((a, b) => a - b)
   }
 
-  const doctorData = orderedDoctors.map((entry) => {
-    const values = new Map<string, number>()
-    for (const [label, value] of entry.values) {
-      values.set(normalizeName(label), value)
+  cellsByRef = new Map(parseWorksheetCells(wsXml, sharedStrings).map((cell) => [cell.ref, cell]))
+  const rowIds = new Map<number, string>()
+  for (let row = table.firstRow; row <= table.lastRow; row++) {
+    const label = cellsByRef.get(`A${row}`)?.textValue.trim()
+    if (!label) continue
+    const resolved = resolveRowId('monitoreo', label)
+    if ('id' in resolved) rowIds.set(row, resolved.id)
+  }
+
+  doctorCols.forEach((col, index) => {
+    const entry = orderedDoctors[index]
+    wsXml = setCellValue(wsXml, encodeCellRef(col, headerRowIdx), entry?.displayName ?? '')
+
+    for (const [row, rowId] of rowIds) {
+      const ref = encodeCellRef(col, row - 1)
+      const target = cellsByRef.get(ref)
+      if (target?.hasFormula) continue
+
+      const value = entry?.values.get(rowId) ?? 0
+      if (!target) {
+        if (value !== 0) wsXml = insertCellIntoSheet(wsXml, ref, `<c r="${ref}"><v>${value}</v></c>`)
+        continue
+      }
+      // Sparse writes; a template value is cleared even when the new value is 0
+      if (value !== 0 || target.rawValue !== '') wsXml = setCellValue(wsXml, ref, value)
     }
-    return { displayName: entry.displayName, values }
   })
 
-  for (let index = 0; index < doctorCols.length; index++) {
-    const col = doctorCols[index].col
-    const entry = doctorData[index]
-    const headerRef = encodeCellRef(col, headerRowIdx)
-    wsXml = setCellValue(wsXml, headerRef, entry?.displayName ?? '')
+  wsXml = setCellValue(wsXml, encodeCellRef(totalCol, headerRowIdx), 'TOTAL')
 
-    if (!entry) continue
+  const firstDoctorCol = doctorCols[0]
+  const lastDoctorCol = doctorCols[doctorCols.length - 1]
+  if (firstDoctorCol !== undefined && lastDoctorCol !== undefined) {
+    cellsByRef = new Map(parseWorksheetCells(wsXml, sharedStrings).map((cell) => [cell.ref, cell]))
+    for (let row = table.firstRow; row <= table.lastRow; row++) {
+      const totalCell = cellsByRef.get(encodeCellRef(totalCol, row - 1))
+      if (!totalCell?.hasFormula) continue
 
-    for (const rowIdx of sortedRows) {
-      if (rowIdx <= headerRowIdx) continue
+      const match = totalCell.formulaText.trim().match(HORIZONTAL_SUM_RE)
+      if (!match || Number(match[2]) !== row || Number(match[4]) !== row) continue
 
-      const rowCells = getSortedRowCells(byRow, rowIdx)
-      const labelCell = rowCells.find((cell) => cell.col === labelCol)
-      const rawLabel = labelCell?.textValue.trim()
-      if (!rawLabel) continue
-
-      const value = entry.values.get(normalizeName(rawLabel)) ?? 0
-      if (value === 0) continue
-
-      wsXml = setCellValue(wsXml, encodeCellRef(col, rowIdx), value)
+      wsXml = setCellFormula(
+        wsXml,
+        totalCell.ref,
+        `SUM(${encodeCellRef(firstDoctorCol, row - 1)}:${encodeCellRef(lastDoctorCol, row - 1)})`,
+      )
     }
   }
 
-  cells = parseWorksheetCells(wsXml, sharedStrings)
-  byRow = rebuildRowsMap(cells)
-  sortedRows = [...byRow.keys()].sort((a, b) => a - b)
-
-  for (const rowIdx of sortedRows) {
-    if (rowIdx <= headerRowIdx) continue
-
-    const rowCells = getSortedRowCells(byRow, rowIdx)
-    const labelCell = rowCells.find((cell) => cell.col === labelCol)
-    const rawLabel = labelCell?.textValue.trim()
-    if (!rawLabel) continue
-
-    const rowLabel = normalizeName(rawLabel)
-    const totalCell = rowCells.find((cell) => cell.col === totalCol)
-    const total = doctorCols.reduce((sum, doctorCol) => {
-      return sum + getCellNumericValue(rowCells.find((cell) => cell.col === doctorCol.col))
-    }, 0)
-
-    if (totalCell?.hasFormula || rowLabel.startsWith('total')) {
-      const firstDoctorCol = doctorCols[0]?.col
-      const lastDoctorCol = doctorCols[doctorCols.length - 1]?.col
-      if (firstDoctorCol !== undefined && lastDoctorCol !== undefined && totalCell?.hasFormula) {
-        wsXml = setCellFormula(
-          wsXml,
-          encodeCellRef(totalCol, rowIdx),
-          `SUM(${encodeCellRef(firstDoctorCol, rowIdx)}:${encodeCellRef(lastDoctorCol, rowIdx)})`,
-        )
-      }
-      wsXml = setCellValue(wsXml, encodeCellRef(totalCol, rowIdx), total)
-    }
-  }
-
-  return normalizeSheetFormulas(wsXml, sharedStrings)
+  return recalculateSimpleFormulas(wsXml, sharedStrings)
 }
 
 async function removeCalcChain(zip: JSZip): Promise<void> {
@@ -905,9 +919,77 @@ async function removeCalcChain(zip: JSZip): Promise<void> {
 // ── Main export ──────────────────────────────────────────────────────────────
 
 export async function writeConsolidatedWorkbook(output: ConsolidatedOutput): Promise<void> {
+  const bytes = await buildConsolidatedWorkbook(output)
+  const outBlob = new Blob([bytes], {
+    type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  })
+  saveAs(outBlob, `OdoLens_Consolidado_${todayISO()}.xlsx`)
+}
+
+/**
+ * Zero results must read as blank cells (user decision 5). With fullCalcOnLoad
+ * Excel recomputes every formula, so blank caches are not enough: the sheet
+ * views hide zero values instead.
+ */
+function hideZeroValues(wsXml: string): string {
+  return wsXml.replace(/<sheetView\b[^>]*?(?=\/?>)/g, (tag) => (
+    /\bshowZeros="/.test(tag)
+      ? tag.replace(/\bshowZeros="[^"]*"/, 'showZeros="0"')
+      : tag.replace(/^<sheetView\b/, '<sheetView showZeros="0"')
+  ))
+}
+
+/** Hidden defined name that lets OdoLens recognize its own output if it is fed back. */
+async function stampOutputMarker(zip: JSZip): Promise<void> {
+  const file = zip.file('xl/workbook.xml')
+  if (!file) return
+  const xml = await file.async('text')
+  if (xml.includes(`name="${ODOLENS_OUTPUT_MARKER}"`)) return
+
+  const definedName = `<definedName name="${ODOLENS_OUTPUT_MARKER}" hidden="1">"OdoLens"</definedName>`
+  const updated = xml.includes('</definedNames>')
+    ? xml.replace('</definedNames>', `${definedName}</definedNames>`)
+    : xml.replace('</sheets>', `</sheets><definedNames>${definedName}</definedNames>`)
+  zip.file('xl/workbook.xml', updated)
+}
+
+/** The template's author metadata must not travel into every consolidated file. */
+async function scrubDocumentProperties(zip: JSZip): Promise<void> {
+  const file = zip.file('docProps/core.xml')
+  if (!file) return
+  const xml = await file.async('text')
+  zip.file(
+    'docProps/core.xml',
+    xml
+      .replace(/<dc:creator>[^<]*<\/dc:creator>/, '<dc:creator>OdoLens</dc:creator>')
+      .replace(/<cp:lastModifiedBy>[^<]*<\/cp:lastModifiedBy>/, '<cp:lastModifiedBy>OdoLens</cp:lastModifiedBy>'),
+  )
+}
+
+/** Ask Excel to recalculate every formula when the file is opened. */
+async function ensureFullCalcOnLoad(zip: JSZip): Promise<void> {
+  const file = zip.file('xl/workbook.xml')
+  if (!file) return
+  const xml = await file.async('text')
+
+  let updated: string
+  if (/<calcPr\b[^>]*\bfullCalcOnLoad="/.test(xml)) {
+    updated = xml.replace(/(<calcPr\b[^>]*\bfullCalcOnLoad=")[^"]*"/, '$11"')
+  } else if (/<calcPr\b/.test(xml)) {
+    updated = xml.replace(/<calcPr\b/, '<calcPr fullCalcOnLoad="1"')
+  } else {
+    const anchor = xml.includes('</definedNames>') ? '</definedNames>' : '</sheets>'
+    updated = xml.replace(anchor, `${anchor}<calcPr fullCalcOnLoad="1"/>`)
+  }
+  zip.file('xl/workbook.xml', updated)
+}
+
+export async function buildConsolidatedWorkbook(output: ConsolidatedOutput): Promise<Uint8Array> {
   // Load the embedded template as a ZIP — keeps every internal file intact
-  const templateBytes = Uint8Array.from(atob(TEMPLATE_BASE64), (c) => c.charCodeAt(0))
+  const templateBytes = Uint8Array.from(atob(TEMPLATE_V2026_BASE64), (c) => c.charCodeAt(0))
   const zip = await JSZip.loadAsync(templateBytes)
+  // Same anchors as the reader: blocks and signature row come from the template itself
+  const templateRaw = XLSX.read(templateBytes, { type: 'array' })
 
   // Parse shared strings (needed to resolve text cell values)
   const ssFile = zip.file('xl/sharedStrings.xml')
@@ -915,13 +997,21 @@ export async function writeConsolidatedWorkbook(output: ConsolidatedOutput): Pro
 
   // Get the sheet name → file path mapping
   const sheetEntries = await getWorkbookSheets(zip)
+  // Already-written sheets, for cross-sheet formulas (Consolidado → Aseguramiento)
+  const writtenSheets: SheetCellIndex = new Map()
 
+  const labeled = (key: LabeledSheetKey) => (xml: string) =>
+    processLabeledSheet(xml, sharedStrings, output[key], key, findBlock(templateRaw, key), writtenSheets)
+
+  // Order matters: Aseguramiento is written before Consolidado reads it
   const sheetProcessors: Array<[string, (xml: string) => string]> = [
-    ['Nacionalidad',     (xml) => processLabeledSheet(xml, sharedStrings, output.nacionalidad)],
-    ['Aseguramiento',   (xml) => processLabeledSheet(xml, sharedStrings, output.aseguramiento)],
-    ['Consolidado',     (xml) => processLabeledSheet(xml, sharedStrings, output.consolidado)],
-    ['Informe Económico',(xml) => processInformeEconomicoSheet(xml, sharedStrings, output.informeEconomico)],
-    ['Monitoreo',       (xml) => processMonitoreoSheet(xml, sharedStrings, output.monitoreo)],
+    ['Nacionalidad', labeled('nacionalidad')],
+    ['Aseguramiento', labeled('aseguramiento')],
+    ['Consolidado', labeled('consolidado')],
+    [ECONOMICO_SHEET, (xml) => processInformeEconomicoSheet(
+      xml, sharedStrings, output.informeEconomico, findEconomicoSignatureRow(templateRaw),
+    )],
+    ['Monitoreo', (xml) => processMonitoreoSheet(xml, sharedStrings, output.monitoreo, findBlock(templateRaw, 'monitoreo'))],
   ]
 
   for (const [sheetName, processor] of sheetProcessors) {
@@ -935,19 +1025,22 @@ export async function writeConsolidatedWorkbook(output: ConsolidatedOutput): Pro
     if (!wsFile) continue
 
     const originalXml = await wsFile.async('text')
-    const updatedXml = processor(originalXml)
+    const updatedXml = hideZeroValues(processor(originalXml))
     zip.file(entry.path, updatedXml)
+    writtenSheets.set(
+      normalizeName(entry.name),
+      new Map(parseWorksheetCells(updatedXml, sharedStrings).map((cell) => [cell.ref, cell])),
+    )
   }
 
   await removeCalcChain(zip)
+  await stampOutputMarker(zip)
+  await ensureFullCalcOnLoad(zip)
+  await scrubDocumentProperties(zip)
 
-  // Generate the output ZIP as a Blob — same compression as original
-  const outBlob = await zip.generateAsync({
-    type: 'blob',
-    mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  return zip.generateAsync({
+    type: 'uint8array',
     compression: 'DEFLATE',
     compressionOptions: { level: 6 },
   })
-
-  saveAs(outBlob, `OdoLens_Consolidado_${todayISO()}.xlsx`)
 }

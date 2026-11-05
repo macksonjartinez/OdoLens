@@ -1,6 +1,11 @@
-/** Normalize a string for deduplication: trim, lowercase, strip accents, collapse whitespace */
+/**
+ * Normalize a string for deduplication: drop invisible format characters
+ * (U+2060, U+200B, U+FEFF...), trim, lowercase, strip accents, collapse whitespace.
+ */
 export function normalizeName(raw: string): string {
   return raw
+    .replace(/\p{Cf}/gu, '')
+    .replace(/ /g, ' ')
     .trim()
     .toLowerCase()
     .normalize('NFD')

@@ -26,7 +26,7 @@ export function StatusBadge({ status, errors }: StatusBadgeProps) {
   }
 
   // invalid
-  const errorMsg = errors?.[0]?.message ?? 'Formato incorrecto'
+  const errorMsg = errors?.find((error) => error.severity !== 'warning')?.message ?? 'Formato incorrecto'
   return (
     <span
       className="flex items-center gap-1 text-xs font-semibold text-red-600"

@@ -7,6 +7,8 @@ export type FileStatus = 'pending' | 'valid' | 'invalid'
 export interface ValidationError {
   sheet: string
   message: string
+  /** Warnings are shown but do not invalidate the file (default: error) */
+  severity?: 'error' | 'warning'
 }
 
 export interface FileEntry {
@@ -33,46 +35,57 @@ export interface ParsedWorkbook {
   sheets: Record<string, ParsedSheet>
   /** Raw SheetJS workbook (kept for potential future use) */
   raw?: WorkBook
+  /** SHA-256 of the file bytes, to detect the same report loaded twice */
+  contentHash?: string
 }
 
 // ── Consolidation output ────────────────────────────────────────────────────
 
+/** Canonical row id: normalized label of the 2026 report template */
+export type RowId = string
+export type InputCol = 'B' | 'C' | 'D' | 'E' | 'F' | 'G' | 'H'
+export type LabeledSheetKey = 'nacionalidad' | 'aseguramiento' | 'consolidado'
+
 export interface LabeledSheet {
-  /** Column headers (row 0 of the original sheet) */
-  headers: CellValue[]
-  /**
-   * Ordered list of row labels as they appear in the first-seen file.
-   * Preserves original display text.
-   */
-  rowOrder: string[]
-  /**
-   * Map from row-label → array of summed numeric values
-   * (one entry per column after the label column)
-   */
-  data: Map<string, number[]>
+  /** Summed capture values per canonical row, by column letter */
+  values: Map<RowId, Record<InputCol, number>>
 }
 
 export interface DoctorEntry {
   /** Original casing from first occurrence */
   displayName: string
-  /** Map from procedure-label → summed value */
-  values: Map<string, number>
+  /** Map from canonical procedure row → summed value */
+  values: Map<RowId, number>
 }
 
 export interface InformeEconomicoSheet {
-  /** Numeric cells that must be summed across all files */
-  sumCells: Map<string, number>
-  /** Non-numeric cells copied from the first non-empty source */
-  copiedCells: Map<string, CellValue>
+  /** Amounts summed across all files */
+  sums: Record<'E13' | 'F13' | 'G13' | 'H13', number>
+  /** Distinct "otros gastos" concepts (I13), joined with "; " */
+  concept: string
+  /** Distinct suppliers (J13), joined with "; " */
+  supplier: string
+  /** First non-empty signer name */
+  signer: string | null
+  /** First sent date (Excel serial) */
+  sentDate: number | null
 }
 
 export interface MonitoreoSheet {
-  /** Fixed column headers before doctor columns (e.g. procedure name col) */
-  fixedHeaders: CellValue[]
-  /** Ordered procedure row labels */
-  rowOrder: string[]
-  /** Map from normalizedDoctorName → DoctorEntry */
+  /** Map from doctor key → DoctorEntry, in first-seen order */
   doctors: Map<string, DoctorEntry>
+}
+
+/** A source row with data that has no approved equivalent in the 2026 template */
+export interface UnmappedRow {
+  file: string
+  sheet: LabeledSheetKey | 'monitoreo'
+  /** 1-based row in the source sheet */
+  row: number
+  label: string
+  total: number
+  /** Proposed 2026 row, pending approval */
+  suggestion?: RowId
 }
 
 export interface ConsolidatedOutput {
@@ -83,8 +96,8 @@ export interface ConsolidatedOutput {
   monitoreo: MonitoreoSheet
   fileCount: number
   doctorCount: number
-  /** Raw SheetJS workbook of the first valid file */
-  templateWorkbook: WorkBook
+  unmapped: UnmappedRow[]
+  warnings: string[]
 }
 
 export type ReportTab = 'estadistico' | 'ejecutivo'

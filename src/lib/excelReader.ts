@@ -19,5 +19,10 @@ export async function readWorkbook(file: File): Promise<ParsedWorkbook> {
     sheets[trimmedName] = { name: trimmedName, rows }
   }
 
-  return { fileName: file.name, sheets, raw: wb }
+  return { fileName: file.name, sheets, raw: wb, contentHash: await sha256Hex(buffer) }
+}
+
+async function sha256Hex(buffer: ArrayBuffer): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', buffer)
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('')
 }

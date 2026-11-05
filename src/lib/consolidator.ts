@@ -1,19 +1,70 @@
+import type { WorkSheet } from 'xlsx'
 import { MONITOREO_NON_DOCTOR_HEADERS } from '../constants/sheetSchema'
 import type {
   ParsedWorkbook,
   LabeledSheet,
+  LabeledSheetKey,
   InformeEconomicoSheet,
   MonitoreoSheet,
   ConsolidatedOutput,
-  CellValue,
   DoctorEntry,
+  InputCol,
+  RowId,
+  UnmappedRow,
 } from '../types'
-import { normalizeName, safeNum, findSheetKey } from './normalize'
+import { normalizeName, safeNum } from './normalize'
+import { SHEET_NAMES, resolveRowId } from '../schema/catalog'
+import {
+  ECONOMICO_SHEET,
+  INPUT_COLS,
+  findBlock,
+  findEconomicoSignatureRow,
+  findScanStart,
+  getSheet,
+  isOdoLensOutput,
+} from '../schema/reportSchemas'
 
-const MONITOREO_HEADER_LABEL = 'nombre del dr'
 const MONITOREO_PLACEHOLDER_DOCTOR_RE = /^dra?\s*\d+$/
-const INFORME_ECONOMICO_SUM_CELLS = ['E13', 'F13', 'G13', 'H13'] as const
-const INFORME_ECONOMICO_COPY_CELLS = ['I13', 'J13', 'D15', 'J15'] as const
+const ECONOMICO_SUM_CELLS = ['E13', 'F13', 'G13', 'H13'] as const
+
+// ── Cell helpers (1-based rows, A1 notation) ────────────────────────────────
+
+function colLetters(idx: number): string {
+  let s = ''
+  let n = idx + 1
+  while (n > 0) {
+    const r = (n - 1) % 26
+    s = String.fromCharCode(65 + r) + s
+    n = Math.floor((n - 1) / 26)
+  }
+  return s
+}
+
+function lastColIndex(ws: WorkSheet): number {
+  const match = ws['!ref']?.match(/:([A-Z]+)\d+$/)
+  if (!match) return 0
+  let n = 0
+  for (const ch of match[1]) n = n * 26 + (ch.charCodeAt(0) - 64)
+  return n - 1
+}
+
+/** Numeric value of a non-formula cell; formula cells are derived data and read as 0 */
+function inputNumber(ws: WorkSheet, ref: string): number {
+  const cell = ws[ref]
+  if (!cell || cell.f) return 0
+  return safeNum(cell.v)
+}
+
+function cellString(ws: WorkSheet, ref: string): string {
+  const value = ws[ref]?.v
+  return value === undefined || value === null ? '' : String(value).trim()
+}
+
+function emptyInputs(): Record<InputCol, number> {
+  return { B: 0, C: 0, D: 0, E: 0, F: 0, G: 0, H: 0 }
+}
+
+// ── Doctor identity ──────────────────────────────────────────────────────────
 
 function normalizeDoctorName(raw: string): string {
   return normalizeName(raw)
@@ -31,233 +82,190 @@ function getPlaceholderDoctorKey(fileName: string, colIdx: number): string {
   return `__placeholder__:${normalizeDoctorName(baseName)}:${colIdx}`
 }
 
-function hasDoctorColumnData(rows: CellValue[][], colIdx: number): boolean {
-  return rows.some((row) => safeNum(row[colIdx]) !== 0)
-}
-
-function findMonitoreoHeaderRowIndex(rows: CellValue[][]): number {
-  return rows.findIndex(
-    (row) => normalizeName(String(row[0] ?? '')) === MONITOREO_HEADER_LABEL,
-  )
-}
-
-function findMonitoreoDataEndRowIndex(rows: CellValue[][], headerRowIdx: number): number {
-  const endLabel = 'pacientes de alta'
-
-  for (let rowIdx = rows.length - 1; rowIdx > headerRowIdx; rowIdx--) {
-    if (normalizeName(String(rows[rowIdx]?.[0] ?? '')) === endLabel) {
-      return rowIdx
-    }
-  }
-
-  return rows.length - 1
-}
-
-function hasVisibleValue(value: CellValue): boolean {
-  return value !== null && value !== ''
-}
-
-function getRawCellValue(
-  workbook: ParsedWorkbook,
-  sheetName: string,
-  ref: string,
-): CellValue {
-  const key = findSheetKey(workbook.sheets, sheetName)
-  if (!key || !workbook.raw) return null
-
-  const sheet = workbook.raw.Sheets[key]
-  const cell = sheet?.[ref]
-  if (!cell) return null
-
-  return cell.v ?? null
-}
-
-// ── Sheets 1–4: row-label summation ─────────────────────────────────────────
+// ── Sheets 1–3: address-based capture blocks ────────────────────────────────
 
 function consolidateLabeledSheet(
-  sheetName: string,
+  sheet: LabeledSheetKey,
   workbooks: ParsedWorkbook[],
+  unmapped: UnmappedRow[],
 ): LabeledSheet {
-  const headers: CellValue[] = []
-  const rowOrder: string[] = []
-  const data = new Map<string, number[]>()
-  // Maps normalizedLabel → display label (first occurrence)
-  const labelDisplay = new Map<string, string>()
+  const values = new Map<RowId, Record<InputCol, number>>()
 
   for (const wb of workbooks) {
-    const key = findSheetKey(wb.sheets, sheetName)
-    const sheet = key ? wb.sheets[key] : undefined
-    if (!sheet || sheet.rows.length === 0) continue
+    if (!wb.raw) continue
+    const ws = getSheet(wb.raw, SHEET_NAMES[sheet])
+    const block = findBlock(wb.raw, sheet)
+    if (!ws || !block) continue
 
-    const [headerRow, ...dataRows] = sheet.rows
+    const seenInFile = new Set<RowId>()
+    const takeDuplicatesOnce = isOdoLensOutput(wb.raw)
 
-    // Capture headers from the first file that has this sheet
-    if (headers.length === 0 && headerRow) {
-      headers.push(...headerRow)
-    }
+    for (let row = findScanStart(wb.raw, sheet, block); row <= block.lastRow; row++) {
+      const label = cellString(ws, `A${row}`)
+      if (!label) continue
 
-    const colCount = Math.max(headers.length, headerRow?.length ?? 0) - 1
-
-    for (const row of dataRows) {
-      const rawLabel = String(row[0] ?? '').trim()
-      if (!rawLabel) continue
-
-      const key = normalizeName(rawLabel)
-
-      if (!data.has(key)) {
-        data.set(key, new Array<number>(colCount).fill(0))
-        rowOrder.push(key)
-        labelDisplay.set(key, rawLabel)
+      const rowValues = emptyInputs()
+      let total = 0
+      for (const col of INPUT_COLS) {
+        rowValues[col] = inputNumber(ws, `${col}${row}`)
+        total += rowValues[col]
       }
 
-      const sums = data.get(key)!
-      for (let col = 1; col <= colCount; col++) {
-        sums[col - 1] += safeNum(row[col])
+      const resolved = resolveRowId(sheet, label)
+      if ('unmapped' in resolved) {
+        if (total !== 0) {
+          unmapped.push({
+            file: wb.fileName, sheet, row, label, total,
+            ...(resolved.suggestion ? { suggestion: resolved.suggestion } : {}),
+          })
+        }
+        continue
       }
+
+      if (seenInFile.has(resolved.id) && takeDuplicatesOnce) continue
+      seenInFile.add(resolved.id)
+
+      const sums = values.get(resolved.id) ?? emptyInputs()
+      for (const col of INPUT_COLS) sums[col] += rowValues[col]
+      values.set(resolved.id, sums)
     }
   }
 
-  // Restore display labels in rowOrder
-  const displayRowOrder = rowOrder.map((key) => labelDisplay.get(key) ?? key)
-
-  return { headers, rowOrder: displayRowOrder, data: remapToDisplay(data, labelDisplay) }
-}
-
-/** Remap the internal normalized-key map back to display keys for output */
-function remapToDisplay(
-  data: Map<string, number[]>,
-  labelDisplay: Map<string, string>,
-): Map<string, number[]> {
-  const out = new Map<string, number[]>()
-  for (const [key, vals] of data) {
-    out.set(labelDisplay.get(key) ?? key, vals)
-  }
-  return out
+  return { values }
 }
 
 // ── Sheet 5: Monitoreo doctor-column merge ───────────────────────────────────
 
-function consolidateMonitoreo(workbooks: ParsedWorkbook[]): MonitoreoSheet {
-  const rowOrder: string[] = []
-  const rowDisplay = new Map<string, string>() // normalized → display
+function consolidateMonitoreo(workbooks: ParsedWorkbook[], unmapped: UnmappedRow[]): MonitoreoSheet {
   const doctors = new Map<string, DoctorEntry>()
-  let fixedHeaders: CellValue[] = []
   let placeholderDoctorCount = 0
 
   for (const wb of workbooks) {
-    const monitoreoKey = findSheetKey(wb.sheets, 'Monitoreo')
-    const sheet = monitoreoKey ? wb.sheets[monitoreoKey] : undefined
-    if (!sheet || sheet.rows.length === 0) continue
+    if (!wb.raw) continue
+    const ws = getSheet(wb.raw, SHEET_NAMES.monitoreo)
+    const block = findBlock(wb.raw, 'monitoreo')
+    if (!ws || !block?.headerRow) continue
 
-    const headerRowIdx = findMonitoreoHeaderRowIndex(sheet.rows)
-    if (headerRowIdx < 0) continue
-
-    const headerRow = sheet.rows[headerRowIdx]
-    const dataEndRowIdx = findMonitoreoDataEndRowIndex(sheet.rows, headerRowIdx)
-    const dataRows = sheet.rows.slice(headerRowIdx + 1, dataEndRowIdx + 1)
-
-    // Identify doctor columns (everything that isn't a known non-doctor header)
-    const doctorColumns: Array<{
-      idx: number
-      rawName: string
-      placeholder: boolean
-      hasData: boolean
-    }> = []
-    headerRow.forEach((cell, idx) => {
-      const rawName = String(cell ?? '').trim()
-      const normalized = normalizeName(rawName)
-      if (idx > 0 && hasVisibleValue(cell) && !MONITOREO_NON_DOCTOR_HEADERS.has(normalized)) {
-        doctorColumns.push({
-          idx,
-          rawName,
-          placeholder: isPlaceholderDoctorName(rawName),
-          hasData: hasDoctorColumnData(dataRows, idx),
-        })
-      }
-    })
-
-    // Fixed headers = all headers that are NOT doctor columns
-    if (fixedHeaders.length === 0) {
-      const doctorColIndices = new Set(doctorColumns.map((column) => column.idx))
-      fixedHeaders = headerRow.filter((_, idx) => !doctorColIndices.has(idx))
+    // Doctor columns run from B up to the total column: the first column whose
+    // first data row holds a formula.
+    const lastCol = lastColIndex(ws)
+    const doctorColumns: Array<{ idx: number; letters: string; rawName: string; placeholder: boolean }> = []
+    for (let idx = 1; idx <= lastCol; idx++) {
+      const letters = colLetters(idx)
+      if (ws[`${letters}${block.firstRow}`]?.f) break
+      const rawName = cellString(ws, `${letters}${block.headerRow}`)
+      if (!rawName || MONITOREO_NON_DOCTOR_HEADERS.has(normalizeName(rawName))) continue
+      doctorColumns.push({ idx, letters, rawName, placeholder: isPlaceholderDoctorName(rawName) })
     }
 
-    for (const row of dataRows) {
-      const rawLabel = String(row[0] ?? '').trim()
-      if (!rawLabel) continue
+    const rows: Array<{ row: number; label: string; id: RowId | null; suggestion?: RowId }> = []
+    for (let row = block.firstRow; row <= block.lastRow; row++) {
+      const label = cellString(ws, `A${row}`)
+      if (!label) continue
+      const resolved = resolveRowId('monitoreo', label)
+      rows.push('unmapped' in resolved
+        ? { row, label, id: null, suggestion: resolved.suggestion }
+        : { row, label, id: resolved.id })
+    }
 
-      const labelKey = normalizeName(rawLabel)
-      if (!rowDisplay.has(labelKey)) {
-        rowOrder.push(labelKey)
-        rowDisplay.set(labelKey, rawLabel)
+    const unmappedTotals = new Map<number, number>()
+
+    for (const column of doctorColumns) {
+      const columnValues = rows.map((r) => inputNumber(ws, `${column.letters}${r.row}`))
+      if (!columnValues.some((value) => value !== 0)) continue
+
+      const doctorKey = column.placeholder
+        ? getPlaceholderDoctorKey(wb.fileName, column.idx)
+        : normalizeDoctorName(column.rawName)
+
+      if (!doctors.has(doctorKey)) {
+        doctors.set(doctorKey, {
+          displayName: column.placeholder ? `Dr. ${++placeholderDoctorCount}` : column.rawName,
+          values: new Map<RowId, number>(),
+        })
       }
+      const doctor = doctors.get(doctorKey)!
 
-      for (const column of doctorColumns) {
-        if (!column.hasData) continue
-
-        const doctorKey = column.placeholder
-          ? getPlaceholderDoctorKey(wb.fileName, column.idx)
-          : normalizeDoctorName(column.rawName)
-
-        if (!doctors.has(doctorKey)) {
-          const doctorDisplayName = column.placeholder
-            ? `Dr. ${++placeholderDoctorCount}`
-            : column.rawName
-
-          doctors.set(doctorKey, {
-            displayName: doctorDisplayName,
-            values: new Map<string, number>(),
-          })
+      rows.forEach((r, i) => {
+        const value = columnValues[i]
+        if (value === 0) return
+        if (r.id === null) {
+          unmappedTotals.set(i, (unmappedTotals.get(i) ?? 0) + value)
+          return
         }
+        doctor.values.set(r.id, (doctor.values.get(r.id) ?? 0) + value)
+      })
+    }
 
-        const doctor = doctors.get(doctorKey)!
-        const procedureLabel = rowDisplay.get(labelKey) ?? rawLabel
-        const existing = doctor.values.get(procedureLabel) ?? 0
-        doctor.values.set(procedureLabel, existing + safeNum(row[column.idx]))
-      }
+    for (const [i, total] of unmappedTotals) {
+      const r = rows[i]
+      unmapped.push({
+        file: wb.fileName, sheet: 'monitoreo', row: r.row, label: r.label, total,
+        ...(r.suggestion ? { suggestion: r.suggestion } : {}),
+      })
     }
   }
 
-  const displayRowOrder = rowOrder.map((key) => rowDisplay.get(key) ?? key)
-
-  return { fixedHeaders, rowOrder: displayRowOrder, doctors }
+  return { doctors }
 }
 
-function consolidateInformeEconomico(workbooks: ParsedWorkbook[]): InformeEconomicoSheet {
-  const sumCells = new Map<string, number>()
-  const copiedCells = new Map<string, CellValue>()
+// ── Sheet 4: Informe económico ───────────────────────────────────────────────
 
-  for (const ref of INFORME_ECONOMICO_SUM_CELLS) {
-    sumCells.set(ref, 0)
+function consolidateInformeEconomico(workbooks: ParsedWorkbook[]): InformeEconomicoSheet {
+  const sums = { E13: 0, F13: 0, G13: 0, H13: 0 }
+  const concepts: string[] = []
+  const suppliers: string[] = []
+  let signer: string | null = null
+  let sentDate: number | null = null
+
+  const addDistinct = (list: string[], value: string) => {
+    if (value && !list.some((existing) => normalizeName(existing) === normalizeName(value))) list.push(value)
   }
 
   for (const wb of workbooks) {
-    for (const ref of INFORME_ECONOMICO_SUM_CELLS) {
-      const current = sumCells.get(ref) ?? 0
-      sumCells.set(ref, current + safeNum(getRawCellValue(wb, 'Informe Económico', ref)))
-    }
+    if (!wb.raw) continue
+    const ws = getSheet(wb.raw, ECONOMICO_SHEET)
+    if (!ws) continue
 
-    for (const ref of INFORME_ECONOMICO_COPY_CELLS) {
-      if (copiedCells.has(ref) && hasVisibleValue(copiedCells.get(ref) ?? null)) continue
+    for (const ref of ECONOMICO_SUM_CELLS) sums[ref] += inputNumber(ws, ref)
+    addDistinct(concepts, cellString(ws, 'I13'))
+    addDistinct(suppliers, cellString(ws, 'J13'))
 
-      const value = getRawCellValue(wb, 'Informe Económico', ref)
-      if (hasVisibleValue(value)) {
-        copiedCells.set(ref, value)
-      }
+    const signatureRow = findEconomicoSignatureRow(wb.raw)
+    if (signatureRow) {
+      signer ??= cellString(ws, `D${signatureRow}`) || null
+      const date = ws[`J${signatureRow}`]?.v
+      if (sentDate === null && typeof date === 'number') sentDate = date
     }
   }
 
-  return { sumCells, copiedCells }
+  return { sums, concept: concepts.join('; '), supplier: suppliers.join('; '), signer, sentDate }
 }
 
 // ── Main entry point ─────────────────────────────────────────────────────────
 
 export function consolidate(workbooks: ParsedWorkbook[]): ConsolidatedOutput {
-  const nacionalidad = consolidateLabeledSheet('Nacionalidad', workbooks)
-  const aseguramiento = consolidateLabeledSheet('Aseguramiento', workbooks)
-  const consolidado = consolidateLabeledSheet('Consolidado', workbooks)
+  const unmapped: UnmappedRow[] = []
+  const nacionalidad = consolidateLabeledSheet('nacionalidad', workbooks, unmapped)
+  const aseguramiento = consolidateLabeledSheet('aseguramiento', workbooks, unmapped)
+  const consolidado = consolidateLabeledSheet('consolidado', workbooks, unmapped)
   const informeEconomico = consolidateInformeEconomico(workbooks)
-  const monitoreo = consolidateMonitoreo(workbooks)
+  const monitoreo = consolidateMonitoreo(workbooks, unmapped)
+
+  const warnings = workbooks
+    .filter((wb) => wb.raw && isOdoLensOutput(wb.raw))
+    .map((wb) => `${wb.fileName}: es un consolidado de OdoLens; sus filas duplicadas se tomaron una sola vez`)
+
+  const byContent = new Map<string, string[]>()
+  for (const wb of workbooks) {
+    if (!wb.contentHash) continue
+    byContent.set(wb.contentHash, [...(byContent.get(wb.contentHash) ?? []), wb.fileName])
+  }
+  for (const names of byContent.values()) {
+    if (names.length > 1) {
+      warnings.push(`${names.join(', ')} tienen el mismo contenido; sus cifras se sumaron ${names.length} veces`)
+    }
+  }
 
   return {
     nacionalidad,
@@ -267,6 +275,7 @@ export function consolidate(workbooks: ParsedWorkbook[]): ConsolidatedOutput {
     monitoreo,
     fileCount: workbooks.length,
     doctorCount: monitoreo.doctors.size,
-    templateWorkbook: workbooks[0].raw!,
+    unmapped,
+    warnings,
   }
 }

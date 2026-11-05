@@ -8,7 +8,8 @@ interface FileListItemProps {
 }
 
 export function FileListItem({ entry, onRemove }: FileListItemProps) {
-  const errorMsg = entry.errors[0]?.message
+  const errorMsg = entry.errors.find((error) => error.severity !== 'warning')?.message
+  const warnings = entry.errors.filter((error) => error.severity === 'warning')
 
   return (
     <div className={`rounded-lg border p-3 ${
@@ -38,6 +39,9 @@ export function FileListItem({ entry, onRemove }: FileListItemProps) {
           {entry.status === 'invalid' && errorMsg && (
             <p className="mt-1 text-xs italic text-gray-400 leading-snug">{errorMsg}</p>
           )}
+          {entry.status === 'valid' && warnings.map((warning) => (
+            <p key={warning.message} className="mt-1 text-xs text-amber-600 leading-snug">{warning.message}</p>
+          ))}
         </div>
 
         {/* Remove */}

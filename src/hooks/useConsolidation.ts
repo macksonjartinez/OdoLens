@@ -4,6 +4,7 @@ import { readWorkbook } from '../lib/excelReader'
 import { validateWorkbook } from '../lib/validator'
 import { consolidate } from '../lib/consolidator'
 import { writeConsolidatedWorkbook } from '../lib/excelWriter'
+import { requiresExportConfirmation } from '../lib/unmapped'
 
 interface UseConsolidationReturn {
   isConsolidating: boolean
@@ -80,7 +81,11 @@ export function useConsolidation(
       try {
         const workbooks = validEntries.map((e) => e.workbook!)
         const output = consolidate(workbooks)
-        await writeConsolidatedWorkbook(output)
+        // Rows without an equivalent in the 2026 template must be acknowledged
+        // on the result screen before anything is downloaded.
+        if (!requiresExportConfirmation(output)) {
+          await writeConsolidatedWorkbook(output)
+        }
         setResult(output)
         return output
       } finally {
